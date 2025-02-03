@@ -1,0 +1,181 @@
+import configparser
+import pymysql
+import traceback
+import threading
+import logging
+from playwright.sync_api import sync_playwright
+
+"""
+Author: PGwanban
+Date: 2024-1-15
+Version: py-yuyue-1.0
+"""
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 读取配置文件
+config = configparser.ConfigParser()
+config.read(
+    r"G:\E盘\工作项目文件\Visual Studio Code\2024.12.20.20.35项目\config.ini",
+    encoding='utf-8'
+)
+
+# 获取数据库配置信息
+db_host = config.get('Database', 'host')
+db_port = config.getint('Database', 'port')
+db_user = config.get('Database', 'user')
+db_password = config.get('Database', 'password')
+db_name = config.get('Database', 'name')
+db_table = config.get('Database', 'table')
+
+# 获取线程相关的参数
+threads_num = config.getint('Thread', 'num')
+
+# 获取地点信息
+province = config.get('Location', 'province')
+city = config.get('Location', 'city')
+country = config.get('Location', 'country')
+default_bank_index = config.getint('Location', 'default_bank_index')
+
+# 获取预约日期信息
+reservation_date_str = config.get('Reservation', 'date')
+
+# ---------------------------------------------------分割线----------------------------------------
+
+def fetch_information(db_host_str, db_port_int, db_user_str, db_password_str, db_name_str, db_table_str):
+    """通过 MySQL 数据库获取信息的逻辑。"""
+    try:
+        connection = pymysql.connect(
+            host=db_host_str,
+            port=db_port_int,
+            user=db_user_str,
+            password=db_password_str,
+            database=db_name_str,
+            charset='utf8mb4'
+        )
+        with connection.cursor() as cursor:
+            # 查询数据库信息
+            cursor.execute(f"SELECT * FROM `{db_table_str}` LIMIT 1;")
+            result = cursor.fetchone()
+        return result
+    except Exception as e:
+        logging.error(f"数据库查询失败: {e}")
+        return None
+    finally:
+        if 'connection' in locals():
+            connection.close()
+
+def main_processing(location_info_lst: list, reservation_date_str: str, input_enable_bool: bool):
+    """
+    主处理函数，用于执行整个预约流程。
+
+    Parameters:
+        - location_info_lst (list): [省, 市, 区/县, 默认银行index]
+        - reservation_date_str (str): 预约日期字符串，格式: '年-月-日'，例如: '2024-01-15'。
+        - input_enable_bool (bool): 是否允许输入。
+    """
+    with sync_playwright() as playwright:
+        try:
+            # 启动浏览器
+            browser = playwright.chromium.launch(headless=False)  # 设置 headless=False 以打开浏览器窗口
+            context = browser.new_context()
+            page = context.new_page()
+
+            # 打开页面
+            page.goto("https://eapply.abchina.com.cn/coin/coin/CoinIssuesDistribution?typeid=202307")
+
+            # 进入欢迎页面并同意预约的逻辑
+            def main_page():
+                page.click('//div[@id="some_id"]/input[1]')  # 根据实际 XPath 更新
+                page.click('//*[@id="I143"]/button[1]')  # 继续按钮
+                logging.info("已进入主页面并点击同意。")
+
+            # 填写个人信息
+            def complete_information(info_tpl: tuple):
+                page.fill('//*[@id="name"]', info_tpl[1])  # 姓名
+                page.fill('//*[@id="identNo"]', info_tpl[2])  # 身份证号
+                page.fill('//*[@id="mobile"]', info_tpl[3])  # 手机号
+                logging.info("已填写个人信息。")
+
+            # 选择兑换网点
+            def choose_location(provinceName: str, cityName: str, countryName: str, defaultBankIndex: int):
+                page.select_option('//*[@id="orglevel1"]', label=provinceName)  # 选择省
+                page.select_option('//*[@id="orglevel2"]', label=cityName)  # 选择市
+                page.select_option('//*[@id="orglevel3"]', label=countryName)  # 选择区/县
+
+                bank_text = page.locator('//*[@id="orglevel4"]').inner_text()
+                bank_arr = bank_text.split("\n")
+
+                try:
+                    default_number = int(bank_arr[default_bank_index].split(' ')[1])
+                except (IndexError, ValueError) as e:
+                    logging.error(f"解析默认银行编号失败: {e}")
+                    return
+
+                if default_number >= 20:
+                    page.select_option('//*[@id="orglevel4"]', index=default_bank_index)  # 选择默认银行
+                else:
+                    for index, coin_info in enumerate(bank_arr[1:], start=1):
+                        try:
+                            coin_number = int(coin_info.split(" ")[1])
+                            if coin_number >= 20:
+                                page.select_option('//*[@id="orglevel4"]', index=index)  # 选择满足条件的银行
+                                break
+                        except (IndexError, ValueError):
+                            continue
+                    else:
+                        logging.warning("没有营业厅有纪念币了...")
+                logging.info("已选择兑换网点。")
+
+            # 选择兑换日期
+            def select_coin_date(coindate_str: str):
+                page.evaluate('''() => {
+                    document.getElementById("coindate").removeAttribute("readonly");
+                }''')  # 移除只读属性
+                page.fill('//*[@id="coindate"]', coindate_str)
+                logging.info("已选择兑换日期。")
+
+            # 提交信息
+            def submit_information():
+                page.click('//*[@id="infosubmit"]')
+                logging.info("信息已提交。")
+
+            # 调用流程
+            main_page()
+            info_tuple = fetch_information(
+                db_host=db_host,
+                db_port=db_port,
+                db_user=db_user,
+                db_password=db_password,
+                db_name=db_name,
+                db_table=db_table
+            )
+            if not info_tuple:
+                logging.error("未获取到任何数据库信息，终止流程。")
+                return
+            complete_information(info_tpl=info_tuple)
+            choose_location(location_info_lst[0], location_info_lst[1], location_info_lst[2], location_info_lst[3])
+            select_coin_date(coindate_str=reservation_date_str)
+            submit_information()
+
+        except Exception as e:
+            logging.error(f"发生异常: {e}")
+            traceback.print_exc()
+        finally:
+            browser.close()
+            if input_enable_bool:
+                input("按任意键继续...")
+
+# ------------------ 启动多线程 ------------------
+def start_threads_without_proxy():
+    for current_thread in range(threads_num):
+        is_input_enable = current_thread == threads_num - 1
+        thread = threading.Thread(
+            target=main_processing,
+            args=([province, city, country, default_bank_index], reservation_date_str, is_input_enable)
+        )
+        thread.start()
+
+if __name__ == "__main__":
+    start_threads_without_proxy()
